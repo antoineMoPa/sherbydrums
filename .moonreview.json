@@ -1,0 +1,9 @@
+{
+  "targets": [
+    {
+      "name": "sherbydrum",
+      "build": "cargo build --locked",
+      "run": "cargo run --locked"
+    }
+  ]
+}
