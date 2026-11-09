@@ -5,3 +5,4 @@ pub mod groove;
 pub mod keyboard;
 pub mod pattern_store;
 pub mod synth;
+mod timbre;

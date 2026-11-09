@@ -3,7 +3,7 @@ use eframe::egui::{self, Color32, FontId, RichText, Sense, Stroke, Vec2};
 use sherbydrum::{
     engine::{Command, CustomPattern, Position, Settings},
     groove::{INSTRUMENTS, Instrument, Pattern, STEPS, Style, groove},
-    keyboard::{KeyEvent, Notes, Order, Rate, Sound, SynthSettings, TEST_SOURCE},
+    keyboard::{KeyEvent, Notes, Order, Rate, Sound, SynthSettings},
     pattern_store::{self, SavedPattern},
 };
 use std::{
@@ -99,7 +99,6 @@ impl Editor {
 pub struct Drummer {
     synth: SynthSettings,
     sent_synth: Option<SynthSettings>,
-    test_note: bool,
     midi_dropped: usize,
     midi_check: Instant,
     midi: Option<crate::midi::Input>,
@@ -111,7 +110,6 @@ pub struct Drummer {
     output: Option<Output>,
     error: Option<String>,
     playing: bool,
-    once_playback: Option<bool>,
     taps: VecDeque<Instant>,
     customs: Vec<SavedPattern>,
     pattern_path: Option<std::path::PathBuf>,
@@ -165,7 +163,6 @@ impl Drummer {
         let mut app = Self {
             synth: SynthSettings::default(),
             sent_synth: None,
-            test_note: false,
             midi_dropped: 0,
             midi_check: Instant::now(),
             midi: None,
@@ -179,7 +176,6 @@ impl Drummer {
             output: None,
             error: None,
             playing: false,
-            once_playback: None,
             taps: VecDeque::with_capacity(5),
             customs,
             pattern_path,
@@ -283,7 +279,6 @@ impl Drummer {
         self.playing = false;
         self.sent_settings = None;
         self.sent_synth = None;
-        self.test_note = false;
         match Output::open() {
             Ok(output) => {
                 self.output = Some(output);
@@ -307,7 +302,6 @@ impl Drummer {
     }
 
     fn panic_keys(&mut self) {
-        self.test_note = false;
         if let Some(output) = &self.output {
             output.telemetry.panic_keys.store(true, Ordering::Release);
         }
@@ -338,7 +332,6 @@ impl Drummer {
     }
 
     fn toggle_play(&mut self) {
-        self.once_playback = None;
         if !self.sync_settings() {
             return;
         }
@@ -462,37 +455,33 @@ impl Drummer {
         ui.add_space(26.0);
         ui.vertical_centered(|ui| {
             let title = self.name(self.selected).to_owned();
-            ui.horizontal(|ui| {
-                let width = ui
-                    .painter()
-                    .layout_no_wrap(title.clone(), FontId::proportional(25.0), INK)
-                    .size()
-                    .x
-                    + 145.0;
-                ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-                ui.add_sized(
-                    Vec2::new(
-                        (width - 145.0).min((ui.available_width() - 145.0).max(80.0)),
-                        0.0,
-                    ),
-                    egui::Label::new(RichText::new(title).size(25.0)).wrap(),
-                );
-                let edit_response = ui.add(
-                    egui::Button::new(RichText::new("    Edit pattern").size(12.0).color(LIME))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(119, 135, 76))),
-                );
-                paint_button_icon(
-                    ui,
-                    &edit_response,
-                    ButtonIcon::Edit,
-                    "    Edit pattern",
-                    12.0,
-                    LIME,
-                );
-                if edit_response.clicked() {
-                    self.open_editor(false);
-                }
-            });
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 40.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(title.clone(), FontId::proportional(25.0), INK)
+                        .size()
+                        .x
+                        + 125.0;
+                    ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+                    ui.add_sized(
+                        Vec2::new(
+                            (width - 125.0).min((ui.available_width() - 125.0).max(80.0)),
+                            40.0,
+                        ),
+                        egui::Label::new(RichText::new(title).size(25.0)).wrap(),
+                    );
+                    let edit_response = ui.add(
+                        egui::Button::new(RichText::new("Edit pattern").size(12.0).color(LIME))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(119, 135, 76))),
+                    );
+                    if edit_response.clicked() {
+                        self.open_editor(false);
+                    }
+                },
+            );
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.add_space(((ui.available_width() - 185.0) / 2.0).max(0.0));
@@ -543,20 +532,20 @@ impl Drummer {
             );
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width().min(750.0), 70.0),
+                Vec2::new(ui.available_width().min(450.0), 56.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    let unit = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
+                    let unit = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                     let play_response = ui
                         .add_enabled(
                             self.output.is_some(),
                             egui::Button::new(
                                 RichText::new(if self.playing { "■ Stop" } else { "    Play" })
-                                    .size(17.0)
+                                    .size(15.0)
                                     .color(BACKGROUND),
                             )
                             .fill(LIME)
-                            .min_size(Vec2::new(unit * 1.25, 70.0)),
+                            .min_size(Vec2::new(unit, 56.0)),
                         )
                         .on_hover_text("Space");
                     if !self.playing {
@@ -565,26 +554,12 @@ impl Drummer {
                             &play_response,
                             ButtonIcon::Play,
                             "    Play",
-                            17.0,
+                            15.0,
                             BACKGROUND,
                         );
                     }
                     if play_response.clicked() {
                         self.toggle_play();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.output.is_some(),
-                            egui::Button::new(RichText::new("Play once").size(13.0))
-                                .min_size(Vec2::new(unit * 0.75, 70.0)),
-                        )
-                        .on_hover_text("Play one bar, then stop.")
-                        .clicked()
-                        && self.sync_settings()
-                        && self.send(Command::PlayOnce)
-                    {
-                        self.playing = true;
-                        self.once_playback = Some(false);
                     }
                     let fill_response = ui
                         .add_enabled(
@@ -597,13 +572,13 @@ impl Drummer {
                                 } else {
                                     "Add fill\n "
                                 })
-                                .size(17.0),
+                                .size(15.0),
                             )
-                            .min_size(Vec2::new(unit, 70.0)),
+                            .min_size(Vec2::new(unit, 56.0)),
                         )
                         .on_hover_text("Enter / F · Starts next sixteenth note");
                     let hint_rect = egui::Rect::from_center_size(
-                        fill_response.rect.center() + Vec2::new(0.0, 17.0),
+                        fill_response.rect.center() + Vec2::new(0.0, 14.0),
                         Vec2::new(82.0, 12.0),
                     );
                     keyboard_hint(ui, hint_rect, "Enter", MUTED);
@@ -649,11 +624,6 @@ impl Drummer {
                             ui.toggle_value(&mut self.synth.hold, "Hold")
                                 .on_hover_text("Keep the chord after releasing the keys; a new chord replaces it.");
                         });
-                        if ui.add_enabled(self.output.is_some(), egui::Button::new(if self.test_note { "Stop test" } else { "Test C" })).clicked()
-                            && self.sync_settings() && self.sync_synth() {
-                            let event = if self.test_note { KeyEvent::AllOff } else { KeyEvent::On { note: 48, velocity: 100 } };
-                            if self.send(Command::Keyboard(TEST_SOURCE, event)) { self.test_note = !self.test_note; }
-                        }
                     });
                 });
                 ui.add_space(10.0);
@@ -672,22 +642,29 @@ impl Drummer {
                     });
                 });
             });
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Effects");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new("Drums + synth").size(11.0).color(MUTED)); });
-            });
-            ui.add_space(8.0);
-            ui.columns(4, |cols| {
-                let effects=&mut self.settings.effects;
-                slider(&mut cols[0], "Drive", &mut effects.drive, 100);
-                slider(&mut cols[1], "Filter", &mut effects.filter, 100);
-                slider(&mut cols[2], "Delay", &mut effects.delay, 100);
-                slider(&mut cols[3], "Reverb", &mut effects.reverb, 100);
-            });
         });
+    }
+
+    fn effects_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(28, 18))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Effects");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("Drums + synth").size(11.0).color(MUTED));
+                    });
+                });
+                ui.add_space(8.0);
+                ui.columns(4, |cols| {
+                    let effects = &mut self.settings.effects;
+                    slider(&mut cols[0], "Drive", &mut effects.drive, 100);
+                    slider(&mut cols[1], "Filter", &mut effects.filter, 100);
+                    slider(&mut cols[2], "Delay", &mut effects.delay, 100);
+                    slider(&mut cols[3], "Reverb", &mut effects.reverb, 100);
+                });
+            });
+        ui.separator();
     }
 
     fn bank(&mut self, ui: &mut egui::Ui) {
@@ -1149,16 +1126,6 @@ impl Drummer {
 
 impl eframe::App for Drummer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if let Some(seen_running) = self.once_playback {
-            let running = self.position().running;
-            if seen_running && !running {
-                self.playing = false;
-                self.once_playback = None;
-            } else if running {
-                self.once_playback = Some(true);
-            }
-        }
-
         if self
             .output
             .as_ref()
@@ -1245,7 +1212,7 @@ impl eframe::App for Drummer {
                     let status = self.midi_error.as_deref().unwrap_or_else(||
                         self.midi.as_ref().map_or("MIDI disconnected", |input| input.status.as_str()));
                     ui.label(RichText::new(status).size(11.0).color(MUTED))
-                        .on_hover_text("Channel 1 keyboard and sustain. Synth knobs: 74 Tone, 71 Attack, 76 Release, 77 Volume. Effects: 14, 15, 30, 31. Channel 10 pads 44–51. Reconnect after adding or unplugging a device.");
+                        .on_hover_text("Channel 1 keyboard and sustain. Synth knobs: 74 Tone, 71 Attack, 76 Release, 77 Volume. Encoder 114 selects sounds. Arp: 93 Notes, 18 Pattern, 19 Rate, 16 Octaves. Effects: 82/14 Drive, 83/15 Filter, 85/30 Delay, 17/31 Reverb. Channel 10 pads 44–51. Reconnect after adding or unplugging a device.");
                     if self.midi.as_ref().is_some_and(|input| input.dropped() > 0) {
                         ui.label("MIDI input overloaded; some events were dropped");
                     }
@@ -1306,6 +1273,7 @@ impl eframe::App for Drummer {
                             ui.set_min_width(ui.available_width());
                             self.bank(ui);
                         });
+                    self.effects_panel(ui);
                     self.keyboard_panel(ui);
                 });
             });
@@ -1339,7 +1307,6 @@ impl eframe::App for Drummer {
 #[derive(Clone, Copy)]
 enum ButtonIcon {
     Play,
-    Edit,
     Undo,
 }
 
@@ -1380,14 +1347,6 @@ fn paint_button_icon(
                 color,
                 Stroke::NONE,
             ));
-        }
-        ButtonIcon::Edit => {
-            ui.painter()
-                .line_segment([point(-4.0, 4.0), point(4.0, -4.0)], stroke);
-            ui.painter()
-                .line_segment([point(-2.0, -4.0), point(4.0, -4.0)], stroke);
-            ui.painter()
-                .line_segment([point(4.0, -4.0), point(4.0, 2.0)], stroke);
         }
         ButtonIcon::Undo => {
             ui.painter().add(egui::Shape::line(
@@ -1533,7 +1492,6 @@ mod tests {
         let mut app = Drummer {
             synth: SynthSettings::default(),
             sent_synth: None,
-            test_note: false,
             midi_dropped: 0,
             midi_check: Instant::now(),
             midi: Some(midi),
@@ -1544,7 +1502,6 @@ mod tests {
             output: Some(output),
             error: None,
             playing: false,
-            once_playback: None,
             taps: VecDeque::new(),
             customs: Vec::new(),
             pattern_path: None,
@@ -1594,6 +1551,102 @@ mod tests {
         editor.undo();
         assert_eq!(editor.draft.pattern, original);
         app.send(Command::Stop);
+        // Exercise the same hardware -> receiver -> desktop model -> audio settings path
+        // used by the visible sliders, including the exact reported CC74 values.
+        for (value, expected) in [(79, 62), (81, 64), (83, 65), (85, 67)] {
+            source.send(&[0xb0, 74, value]).unwrap();
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(10));
+                app.handle_midi();
+                app.sync_synth();
+                if app.synth.tone == expected {
+                    break;
+                }
+            }
+            assert_eq!(app.synth.tone, expected);
+            assert_eq!(app.sent_synth.unwrap().tone, expected);
+        }
+        for control in [71, 76, 77] {
+            source.send(&[0xb0, control, 127]).unwrap();
+        }
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(10));
+            app.handle_midi();
+            app.sync_synth();
+            if app.synth.volume == 100 {
+                break;
+            }
+        }
+        assert_eq!(
+            (app.synth.attack_ms, app.synth.release_ms, app.synth.volume),
+            (1000, 2000, 100)
+        );
+        assert_eq!(app.sent_synth, Some(app.synth));
+        source.send(&[0xb0, 114, 64]).unwrap();
+        source.send(&[0xb0, 114, 65]).unwrap();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(10));
+            app.handle_midi();
+            app.sync_synth();
+            if app.synth.sound == Sound::Soft {
+                break;
+            }
+        }
+        assert_eq!(app.synth.sound, Sound::Soft);
+        assert_eq!(app.sent_synth, Some(app.synth));
+        for (control, value) in [(93, 64), (18, 64), (19, 90), (16, 127)] {
+            source.send(&[0xb0, control, value]).unwrap();
+        }
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(10));
+            app.handle_midi();
+            app.sync_synth();
+            if app.synth.octaves == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            (
+                app.synth.notes,
+                app.synth.order,
+                app.synth.rate,
+                app.synth.octaves
+            ),
+            (Notes::Minor, Order::UpDown, Rate::Sixteenth, 3)
+        );
+        assert_eq!(app.sent_synth, Some(app.synth));
+
+        for (controls, expected) in [
+            (
+                [(82, 127), (83, 127), (85, 93), (17, 105)],
+                [100, 100, 73, 83],
+            ),
+            ([(82, 0), (83, 0), (85, 0), (17, 0)], [0, 0, 0, 0]),
+        ] {
+            for (control, value) in controls {
+                source.send(&[0xb0, control, value]).unwrap();
+            }
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(10));
+                app.handle_midi();
+                let effects = app.settings.effects;
+                if [effects.drive, effects.filter, effects.delay, effects.reverb] == expected {
+                    break;
+                }
+            }
+            let effects = app.settings.effects;
+            assert_eq!(
+                [effects.drive, effects.filter, effects.delay, effects.reverb],
+                expected
+            );
+            assert!(effects.enabled);
+            if let Some(editor) = &app.editor {
+                assert_eq!(editor.sent_preview.unwrap().effects, effects);
+            } else {
+                assert_eq!(app.sent_settings.unwrap().effects, effects);
+            }
+            app.editor = None;
+        }
     }
 
     fn test_editor() -> Editor {

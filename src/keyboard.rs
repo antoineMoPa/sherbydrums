@@ -1,4 +1,5 @@
 //! Polyphonic keyboard voices and arpeggiation, driven exclusively by audio frames.
+use crate::timbre::Timbre;
 use std::f32::consts::TAU;
 
 pub const MIDI_SOURCES: usize = 16;
@@ -16,7 +17,16 @@ macro_rules! choices {
         }
     };
 }
-choices!(Sound { Warm => "Warm keys", Soft => "Soft pad", Bass => "Round bass", Bright => "Bright lead" });
+choices!(Sound {
+    Warm => "Velvet keys", Soft => "Orbit pad", Bass => "Rubber bass", Bright => "Neon stack",
+    Acid => "Acid bite", Glass => "Glass FM", Pixel => "Pixel pulse", Organ => "Tape organ"
+});
+impl Sound {
+    pub fn stepped(self, steps: i16) -> Self {
+        let index = Self::ALL.iter().position(|sound| *sound == self).unwrap() as i16;
+        Self::ALL[(index + steps).rem_euclid(Self::ALL.len() as i16) as usize]
+    }
+}
 choices!(Notes { Played => "Played", Major => "Major", Minor => "Minor", Minor7 => "Minor 7", Sus2 => "Sus 2" });
 choices!(Order { Up => "Up", Down => "Down", UpDown => "Up / down", Random => "Random", AsPlayed => "As played" });
 choices!(Rate { Quarter => "1/4", Eighth => "1/8", Triplet => "1/8 triplet", Sixteenth => "1/16", ThirtySecond => "1/32" });
@@ -64,14 +74,14 @@ impl Default for SynthSettings {
         Self {
             enabled: true,
             sound: Sound::Warm,
-            tone: 62,
-            attack_ms: 8,
-            release_ms: 420,
+            tone: 68,
+            attack_ms: 6,
+            release_ms: 500,
             volume: 65,
             arp: false,
-            notes: Notes::Played,
+            notes: Notes::Minor,
             order: Order::Up,
-            rate: Rate::Eighth,
+            rate: Rate::Sixteenth,
             octaves: 1,
             gate: 65,
             hold: false,
@@ -94,10 +104,14 @@ impl SynthSettings {
     pub fn select_sound(&mut self, sound: Sound) {
         self.sound = sound;
         (self.tone, self.attack_ms, self.release_ms) = match sound {
-            Sound::Warm => (62, 8, 420),
-            Sound::Soft => (38, 360, 1400),
-            Sound::Bass => (24, 4, 120),
-            Sound::Bright => (85, 6, 240),
+            Sound::Warm => (68, 6, 500),
+            Sound::Soft => (48, 420, 1400),
+            Sound::Bass => (65, 4, 140),
+            Sound::Bright => (85, 10, 300),
+            Sound::Acid => (75, 3, 110),
+            Sound::Glass => (90, 3, 1100),
+            Sound::Pixel => (82, 3, 80),
+            Sound::Organ => (78, 4, 180),
         };
     }
 }
@@ -131,7 +145,7 @@ impl KeyEvent {
 struct Voice {
     note: u8,
     velocity: f32,
-    phase: f32,
+    timbre: Timbre,
     increment: f32,
     level: f32,
     release_step: f32,
@@ -158,6 +172,8 @@ pub struct Keyboard {
     desired: [u8; 128],
     voices: [Voice; VOICES],
     filter: f32,
+    color_decay: f32,
+    tone: f32,
     gain: f32,
     random: u32,
     pub sounding_note: Option<u8>,
@@ -182,6 +198,8 @@ impl Keyboard {
             desired: [0; 128],
             voices: [Voice::default(); VOICES],
             filter: 0.0,
+            color_decay: 0.0,
+            tone: 0.0,
             gain: 0.0,
             random: 0x724a_138b,
             sounding_note: None,
@@ -212,10 +230,18 @@ impl Keyboard {
         if !settings.hold {
             self.latched.fill(0);
         }
+        if self.settings.sound != settings.sound {
+            for voice in &mut self.voices {
+                if voice.active && !voice.releasing {
+                    voice.timbre.restart_color();
+                }
+            }
+        }
         self.settings = settings;
         let cutoff =
             (180.0 * 100.0_f32.powf(f32::from(settings.tone) / 100.0)).min(self.sample_rate * 0.45);
         self.filter = 1.0 - (-TAU * cutoff / self.sample_rate).exp();
+        self.color_decay = Timbre::decay(settings.sound, self.sample_rate);
         if !settings.enabled {
             self.panic();
             return;
@@ -462,12 +488,8 @@ impl Keyboard {
         }
         let attack =
             1.0 / (self.sample_rate * (f32::from(self.settings.attack_ms) / 1000.0).max(0.003));
-        let harmonics = match self.settings.sound {
-            Sound::Soft => [1.0, 0.0, 0.0, 0.0],
-            Sound::Warm => [0.8, 0.12, 0.06, 0.02],
-            Sound::Bass => [0.85, 0.15, 0.0, 0.0],
-            Sound::Bright => [0.55, 0.25, 0.13, 0.07],
-        };
+        self.tone +=
+            (f32::from(self.settings.tone) / 100.0 - self.tone) / (self.sample_rate * 0.01);
         let mut sum = 0.0;
         for voice in &mut self.voices {
             if !voice.active {
@@ -482,14 +504,14 @@ impl Keyboard {
             } else {
                 voice.level = (voice.level + attack).min(1.0);
             }
-            voice.phase = (voice.phase + voice.increment).fract();
-            let mut wave = 0.0;
-            for (i, amount) in harmonics.iter().enumerate() {
-                let harmonic = (i + 1) as f32;
-                if *amount > 0.0 && voice.increment * harmonic < 0.48 {
-                    wave += (voice.phase * TAU * harmonic).sin() * amount;
-                }
-            }
+            let wave = voice.timbre.sample(
+                self.settings.sound,
+                voice.increment,
+                self.sample_rate,
+                self.tone,
+                voice.velocity,
+                self.color_decay,
+            );
             voice.low += self.filter * (wave - voice.low);
             sum += voice.low * voice.level * voice.velocity * 0.16;
         }
@@ -502,6 +524,18 @@ impl Keyboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn played_settings() -> SynthSettings {
+        SynthSettings {
+            notes: Notes::Played,
+            ..SynthSettings::default()
+        }
+    }
+    fn played_keyboard(rate: u32) -> Keyboard {
+        let mut keyboard = Keyboard::new(rate);
+        keyboard.configure(played_settings());
+        keyboard
+    }
+
     fn on(k: &mut Keyboard, note: u8) {
         k.event(
             0,
@@ -516,6 +550,97 @@ mod tests {
     }
     fn energy(k: &mut Keyboard, frames: usize) -> f32 {
         (0..frames).map(|_| k.next_sample().abs()).sum()
+    }
+
+    #[test]
+    fn sounds_have_distinct_waveforms_and_tone_changes_held_notes() {
+        let render = |sound, tone| {
+            let mut k = played_keyboard(48000);
+            let mut settings = played_settings();
+            settings.select_sound(sound);
+            settings.tone = tone;
+            settings.attack_ms = 3;
+            k.configure(settings);
+            on(&mut k, 48);
+            (0..8192).map(|_| k.next_sample()).collect::<Vec<_>>()
+        };
+        let waves: Vec<_> = Sound::ALL.iter().map(|s| render(*s, 75)).collect();
+        for i in 0..waves.len() {
+            for j in i + 1..waves.len() {
+                let a = &waves[i];
+                let b = &waves[j];
+                let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+                let energy_a = a.iter().map(|x| x * x).sum::<f32>();
+                let energy_b = b.iter().map(|x| x * x).sum::<f32>();
+                let similarity = dot.abs() / (energy_a * energy_b).sqrt();
+                assert!(
+                    similarity < 0.96,
+                    "Too similar: {:?} and {:?}: {similarity}",
+                    Sound::ALL[i],
+                    Sound::ALL[j]
+                );
+            }
+        }
+        for sound in Sound::ALL {
+            let dark = render(*sound, 5);
+            let bright = render(*sound, 95);
+            let difference = dark
+                .iter()
+                .zip(&bright)
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>();
+            assert!(difference > 10.0, "Tone has little effect on {sound:?}");
+        }
+        let mut k = played_keyboard(48000);
+        on(&mut k, 60);
+        energy(&mut k, 1000);
+        k.configure(SynthSettings {
+            tone: 5,
+            ..played_settings()
+        });
+        assert_eq!(
+            k.voices.iter().filter(|v| v.active && !v.releasing).count(),
+            1
+        );
+        assert!(energy(&mut k, 1000) > 0.1);
+    }
+
+    #[test]
+    fn preset_changes_restore_attack_color_on_a_held_note() {
+        let mut k = played_keyboard(48000);
+        on(&mut k, 60);
+        energy(&mut k, 48000 * 8);
+        let mut settings = played_settings();
+        settings.select_sound(Sound::Glass);
+        k.configure(settings);
+        assert!(energy(&mut k, 4096) > 100.0);
+        assert_eq!(
+            k.voices.iter().filter(|v| v.active && !v.releasing).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sound_models_stay_finite_across_rates_and_keyboard_range() {
+        for rate in [22050, 44100, 96000] {
+            for sound in Sound::ALL {
+                for note in [24, 60, 96, 127] {
+                    let mut k = played_keyboard(rate);
+                    let mut settings = played_settings();
+                    settings.select_sound(*sound);
+                    settings.tone = 100;
+                    k.configure(settings);
+                    on(&mut k, note);
+                    for _ in 0..rate / 10 {
+                        let sample = k.next_sample();
+                        assert!(
+                            sample.is_finite() && sample.abs() < 0.5,
+                            "{sound:?} note {note} at {rate}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -559,7 +684,7 @@ mod tests {
     }
     #[test]
     fn chord_choices_expand_from_latest_key_and_stay_in_midi_range() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         for (notes, expected) in [
             (Notes::Played, vec![60]),
             (Notes::Major, vec![60, 64, 67]),
@@ -570,7 +695,7 @@ mod tests {
             k.panic();
             k.configure(SynthSettings {
                 notes,
-                ..SynthSettings::default()
+                ..played_settings()
             });
             on(&mut k, 60);
             assert_eq!(pitches(&k), expected);
@@ -584,14 +709,14 @@ mod tests {
             notes: Notes::Major,
             arp: true,
             octaves: 3,
-            ..SynthSettings::default()
+            ..played_settings()
         });
         on(&mut k, 125);
         assert_eq!(pitches(&k), vec![125]);
     }
     #[test]
     fn sustain_releases_and_identical_notes_from_other_sources_survive() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         on(&mut k, 60);
         k.event(
             1,
@@ -612,11 +737,11 @@ mod tests {
     }
     #[test]
     fn hold_keeps_entire_chord_then_replaces_it_and_panic_clears_it() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         let settings = SynthSettings {
             arp: true,
             hold: true,
-            ..SynthSettings::default()
+            ..played_settings()
         };
         k.configure(settings);
         for n in [60, 64, 67] {
@@ -642,7 +767,7 @@ mod tests {
     }
     #[test]
     fn order_octaves_gate_and_audio_clock_produce_expected_notes() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         k.set_bpm(120);
         let settings = SynthSettings {
             arp: true,
@@ -650,7 +775,7 @@ mod tests {
             rate: Rate::Sixteenth,
             octaves: 2,
             gate: 50,
-            ..SynthSettings::default()
+            ..played_settings()
         };
         k.configure(settings);
         on(&mut k, 60);
@@ -677,12 +802,12 @@ mod tests {
     }
     #[test]
     fn fractional_timing_and_tempo_changes_preserve_progress() {
-        let mut k = Keyboard::new(44_100);
+        let mut k = played_keyboard(44_100);
         k.set_bpm(137);
         k.configure(SynthSettings {
             arp: true,
             rate: Rate::Triplet,
-            ..SynthSettings::default()
+            ..played_settings()
         });
         on(&mut k, 60);
         let duration = 44_100.0 * 60.0 / 137.0 / 3.0;
@@ -698,11 +823,11 @@ mod tests {
     }
     #[test]
     fn as_played_order_and_random_stay_in_the_chord() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         let settings = SynthSettings {
             arp: true,
             order: Order::AsPlayed,
-            ..SynthSettings::default()
+            ..played_settings()
         };
         k.configure(settings);
         for n in [67, 60, 64] {
@@ -726,8 +851,8 @@ mod tests {
     fn voice_output_is_velocity_sensitive_finite_and_releases() {
         for sound in Sound::ALL {
             let render = |velocity| {
-                let mut k = Keyboard::new(48_000);
-                let mut settings = SynthSettings::default();
+                let mut k = played_keyboard(48_000);
+                let mut settings = played_settings();
                 settings.select_sound(*sound);
                 k.configure(settings);
                 k.event(0, KeyEvent::On { note: 60, velocity });
@@ -745,7 +870,7 @@ mod tests {
     }
     #[test]
     fn test_source_stop_does_not_release_physical_keys_and_power_clears_latch() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         on(&mut k, 60);
         k.event(
             TEST_SOURCE,
@@ -758,14 +883,14 @@ mod tests {
         assert_eq!(pitches(&k), vec![60]);
         k.configure(SynthSettings {
             enabled: false,
-            ..SynthSettings::default()
+            ..played_settings()
         });
-        k.configure(SynthSettings::default());
+        k.configure(played_settings());
         assert!(pitches(&k).is_empty());
     }
     #[test]
     fn retrigger_under_sustain_starts_a_fresh_voice() {
-        let mut k = Keyboard::new(48_000);
+        let mut k = played_keyboard(48_000);
         on(&mut k, 60);
         energy(&mut k, 1000);
         k.event(0, KeyEvent::Sustain(true));

@@ -3,7 +3,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 use sherbydrum::{
     effects::EffectSettings,
     groove::Instrument,
-    keyboard::{KeyEvent, MIDI_SOURCES, SynthSettings},
+    keyboard::{KeyEvent, MIDI_SOURCES, Notes, Order, Rate, SynthSettings},
 };
 use std::sync::{
     Arc,
@@ -61,7 +61,7 @@ impl Input {
                         && pad_hit(&message).is_none()
                         && KeyEvent::from_midi(&message).is_none()
                         && SynthControl::from_midi(&message).is_none()
-                        && !matches!(message, [0xb0, 14 | 15 | 30 | 31, 0..=127])
+                        && EffectControl::from_midi(&message).is_none()
                     {
                         return;
                     }
@@ -155,6 +155,11 @@ enum SynthControl {
     Attack(u8),
     Release(u8),
     Volume(u8),
+    SoundStep(i16),
+    ArpNotes(u8),
+    ArpPattern(u8),
+    ArpRate(u8),
+    ArpOctaves(u8),
 }
 
 impl SynthControl {
@@ -164,6 +169,11 @@ impl SynthControl {
             [0xb0, 71, value @ 0..=127] => Some(Self::Attack(*value)),
             [0xb0, 76, value @ 0..=127] => Some(Self::Release(*value)),
             [0xb0, 77, value @ 0..=127] => Some(Self::Volume(*value)),
+            [0xb0, 93, value @ 0..=127] => Some(Self::ArpNotes(*value)),
+            [0xb0, 18, value @ 0..=127] => Some(Self::ArpPattern(*value)),
+            [0xb0, 19, value @ 0..=127] => Some(Self::ArpRate(*value)),
+            [0xb0, 16, value @ 0..=127] => Some(Self::ArpOctaves(*value)),
+            [0xb0, 114, value @ 0..=127] => Some(Self::SoundStep(i16::from(*value) - 64)),
             _ => None,
         }
     }
@@ -174,6 +184,18 @@ pub fn apply_synth_control(bytes: &[u8], synth: &mut SynthSettings) -> bool {
         return false;
     };
     match control {
+        SynthControl::ArpNotes(value) => {
+            synth.notes = Notes::ALL[usize::from(value) * Notes::ALL.len() / 128]
+        }
+        SynthControl::ArpPattern(value) => {
+            synth.order = Order::ALL[usize::from(value) * Order::ALL.len() / 128]
+        }
+        SynthControl::ArpRate(value) => {
+            synth.rate = Rate::ALL[usize::from(value) * Rate::ALL.len() / 128]
+        }
+        SynthControl::ArpOctaves(value) => synth.octaves = 1 + (u16::from(value) * 3 / 128) as u8,
+        SynthControl::SoundStep(0) => return false,
+        SynthControl::SoundStep(steps) => synth.select_sound(synth.sound.stepped(steps)),
         SynthControl::Tone(value) => synth.tone = ((u16::from(value) * 100 + 63) / 127) as u8,
         SynthControl::Attack(value) => {
             synth.attack_ms = ((u32::from(value) * 1000 + 63) / 127) as u16
@@ -186,18 +208,36 @@ pub fn apply_synth_control(bytes: &[u8], synth: &mut SynthSettings) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectControl {
+    Drive(u8),
+    Filter(u8),
+    Delay(u8),
+    Reverb(u8),
+}
+impl EffectControl {
+    fn from_midi(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [0xb0, 14 | 82, value @ 0..=127] => Some(Self::Drive(*value)),
+            [0xb0, 15 | 83, value @ 0..=127] => Some(Self::Filter(*value)),
+            [0xb0, 30 | 85, value @ 0..=127] => Some(Self::Delay(*value)),
+            [0xb0, 31 | 17, value @ 0..=127] => Some(Self::Reverb(*value)),
+            _ => None,
+        }
+    }
+}
+
 pub fn apply_effect_control(bytes: &[u8], effects: &mut EffectSettings) -> bool {
-    let [0xb0, control, value @ 0..=127] = bytes else {
+    let Some(control) = EffectControl::from_midi(bytes) else {
         return false;
     };
-    let amount = ((u16::from(*value) * 100 + 63) / 127) as u8;
-    match control {
-        14 => effects.drive = amount,
-        15 => effects.filter = amount,
-        30 => effects.delay = amount,
-        31 => effects.reverb = amount,
-        _ => return false,
-    }
+    let (value, target) = match control {
+        EffectControl::Drive(value) => (value, &mut effects.drive),
+        EffectControl::Filter(value) => (value, &mut effects.filter),
+        EffectControl::Delay(value) => (value, &mut effects.delay),
+        EffectControl::Reverb(value) => (value, &mut effects.reverb),
+    };
+    *target = ((u16::from(value) * 100 + 63) / 127) as u8;
     effects.enabled = true;
     true
 }
@@ -213,6 +253,90 @@ pub fn pad_hit(bytes: &[u8]) -> Option<(Instrument, u8)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arp_knobs_cover_choices_without_changing_other_settings() {
+        for value in 0..=127 {
+            for control in [93, 18, 19, 16] {
+                let mut settings = SynthSettings::default();
+                let mut expected = settings;
+                match control {
+                    93 => {
+                        expected.notes = match value {
+                            0..=25 => Notes::Played,
+                            26..=51 => Notes::Major,
+                            52..=76 => Notes::Minor,
+                            77..=102 => Notes::Minor7,
+                            _ => Notes::Sus2,
+                        }
+                    }
+                    18 => {
+                        expected.order = match value {
+                            0..=25 => Order::Up,
+                            26..=51 => Order::Down,
+                            52..=76 => Order::UpDown,
+                            77..=102 => Order::Random,
+                            _ => Order::AsPlayed,
+                        }
+                    }
+                    19 => {
+                        expected.rate = match value {
+                            0..=25 => Rate::Quarter,
+                            26..=51 => Rate::Eighth,
+                            52..=76 => Rate::Triplet,
+                            77..=102 => Rate::Sixteenth,
+                            _ => Rate::ThirtySecond,
+                        }
+                    }
+                    16 => {
+                        expected.octaves = match value {
+                            0..=42 => 1,
+                            43..=85 => 2,
+                            _ => 3,
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(apply_synth_control(&[0xb0, control, value], &mut settings));
+                assert_eq!(settings, expected);
+                assert!(settings.validate().is_ok());
+                let before = settings;
+                assert!(!apply_synth_control(&[0xb1, control, value], &mut settings));
+                assert_eq!(settings, before);
+            }
+        }
+    }
+
+    #[test]
+    fn sound_encoder_uses_relative_steps_and_ignores_neutral() {
+        use super::*;
+        use sherbydrum::keyboard::Sound;
+        let mut settings = SynthSettings {
+            tone: 23,
+            volume: 42,
+            ..SynthSettings::default()
+        };
+        assert!(!apply_synth_control(&[0xb0, 114, 64], &mut settings));
+        assert_eq!(settings.tone, 23);
+        for (value, expected) in [
+            (65, Sound::Soft),
+            (64, Sound::Soft),
+            (66, Sound::Bright),
+            (64, Sound::Bright),
+            (61, Sound::Warm),
+            (63, Sound::Organ),
+            (65, Sound::Warm),
+        ] {
+            apply_synth_control(&[0xb0, 114, value], &mut settings);
+            assert_eq!(settings.sound, expected);
+            assert_eq!(settings.volume, 42);
+            assert!(settings.validate().is_ok());
+        }
+        let before = settings;
+        assert!(!apply_synth_control(&[0xb1, 114, 65], &mut settings));
+        assert!(!apply_synth_control(&[0xb0, 114, 128], &mut settings));
+        assert_eq!(settings, before);
+    }
+
     #[test]
     fn synth_knobs_map_endpoints_midpoint_and_preserve_other_controls() {
         use super::*;
@@ -389,7 +513,7 @@ mod tests {
 
     #[test]
     fn effect_knobs_map_full_range_and_keep_other_settings() {
-        for control in [14, 15, 30, 31] {
+        for control in [14, 15, 30, 31, 82, 83, 85, 17] {
             for (value, amount) in [(0, 0), (64, 50), (127, 100)] {
                 let mut effects = EffectSettings::default();
                 assert!(apply_effect_control(&[0xb0, control, value], &mut effects));
@@ -398,10 +522,10 @@ mod tests {
                     ..EffectSettings::default()
                 };
                 match control {
-                    14 => expected.drive = amount,
-                    15 => expected.filter = amount,
-                    30 => expected.delay = amount,
-                    31 => expected.reverb = amount,
+                    14 | 82 => expected.drive = amount,
+                    15 | 83 => expected.filter = amount,
+                    30 | 85 => expected.delay = amount,
+                    31 | 17 => expected.reverb = amount,
                     _ => unreachable!(),
                 }
                 assert_eq!(effects, expected);
@@ -409,6 +533,10 @@ mod tests {
         }
         for bytes in [
             &[0xb1, 14, 127][..],
+            &[0xb1, 82, 127],
+            &[0xb9, 83, 127],
+            &[0xb0, 85, 128],
+            &[0xb0, 17],
             &[0xb0, 16, 127],
             &[0xb0, 14, 128],
             &[0xb0, 14],
