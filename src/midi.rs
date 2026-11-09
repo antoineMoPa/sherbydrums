@@ -3,7 +3,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 use sherbydrum::{
     effects::EffectSettings,
     groove::Instrument,
-    keyboard::{KeyEvent, MIDI_SOURCES},
+    keyboard::{KeyEvent, MIDI_SOURCES, SynthSettings},
 };
 use std::sync::{
     Arc,
@@ -60,6 +60,7 @@ impl Input {
                     if !toggle_record
                         && pad_hit(&message).is_none()
                         && KeyEvent::from_midi(&message).is_none()
+                        && SynthControl::from_midi(&message).is_none()
                         && !matches!(message, [0xb0, 14 | 15 | 30 | 31, 0..=127])
                     {
                         return;
@@ -148,6 +149,43 @@ fn record_button_pressed(bytes: &[u8], down: &mut bool) -> bool {
     rising
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SynthControl {
+    Tone(u8),
+    Attack(u8),
+    Release(u8),
+    Volume(u8),
+}
+
+impl SynthControl {
+    fn from_midi(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [0xb0, 74, value @ 0..=127] => Some(Self::Tone(*value)),
+            [0xb0, 71, value @ 0..=127] => Some(Self::Attack(*value)),
+            [0xb0, 76, value @ 0..=127] => Some(Self::Release(*value)),
+            [0xb0, 77, value @ 0..=127] => Some(Self::Volume(*value)),
+            _ => None,
+        }
+    }
+}
+
+pub fn apply_synth_control(bytes: &[u8], synth: &mut SynthSettings) -> bool {
+    let Some(control) = SynthControl::from_midi(bytes) else {
+        return false;
+    };
+    match control {
+        SynthControl::Tone(value) => synth.tone = ((u16::from(value) * 100 + 63) / 127) as u8,
+        SynthControl::Attack(value) => {
+            synth.attack_ms = ((u32::from(value) * 1000 + 63) / 127) as u16
+        }
+        SynthControl::Release(value) => {
+            synth.release_ms = 30 + ((u32::from(value) * 1970 + 63) / 127) as u16
+        }
+        SynthControl::Volume(value) => synth.volume = ((u16::from(value) * 100 + 63) / 127) as u8,
+    }
+    true
+}
+
 pub fn apply_effect_control(bytes: &[u8], effects: &mut EffectSettings) -> bool {
     let [0xb0, control, value @ 0..=127] = bytes else {
         return false;
@@ -175,6 +213,55 @@ pub fn pad_hit(bytes: &[u8]) -> Option<(Instrument, u8)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn synth_knobs_map_endpoints_midpoint_and_preserve_other_controls() {
+        use super::*;
+        for (control, expected_values) in [
+            (74, [0, 50, 100]),
+            (71, [0, 504, 1000]),
+            (76, [30, 1023, 2000]),
+            (77, [0, 50, 100]),
+        ] {
+            for (value, expected) in [0, 64, 127].into_iter().zip(expected_values) {
+                let initial = SynthSettings {
+                    enabled: false,
+                    arp: true,
+                    hold: true,
+                    ..SynthSettings::default()
+                };
+                let mut synth = initial;
+                assert!(apply_synth_control(&[0xb0, control, value], &mut synth));
+                let mut wanted = initial;
+                match control {
+                    74 => wanted.tone = expected as u8,
+                    71 => wanted.attack_ms = expected,
+                    76 => wanted.release_ms = expected,
+                    77 => wanted.volume = expected as u8,
+                    _ => unreachable!(),
+                }
+                assert_eq!(synth, wanted);
+                assert!(synth.validate().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn synth_knobs_reject_other_channels_and_invalid_messages() {
+        use super::*;
+        for bytes in [
+            &[0xb1, 74, 127][..],
+            &[0xb9, 71, 127],
+            &[0xb0, 74, 128],
+            &[0xb0, 74],
+            &[0x90, 74, 100],
+            &[0xb0, 14, 127],
+        ] {
+            let mut synth = SynthSettings::default();
+            assert!(!apply_synth_control(bytes, &mut synth));
+            assert_eq!(synth, SynthSettings::default());
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "Requires native CoreMIDI"]
@@ -227,6 +314,26 @@ mod tests {
             engine.next_sample();
         }
         assert_eq!(engine.next_sample(), 0.0);
+        for control in [74, 71, 76, 77] {
+            source.send(&[0xb0, control, 127]).unwrap();
+        }
+        let mut synth = SynthSettings::default();
+        let mut controls = 0;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(10));
+            for event in input.drain() {
+                assert!(apply_synth_control(&event.bytes, &mut synth));
+                controls += 1;
+            }
+            if controls == 4 {
+                break;
+            }
+        }
+        assert_eq!(controls, 4);
+        assert_eq!(
+            (synth.tone, synth.attack_ms, synth.release_ms, synth.volume),
+            (100, 1000, 2000, 100)
+        );
         drop(source);
         std::thread::sleep(Duration::from_millis(100));
         assert!(input.disconnected());

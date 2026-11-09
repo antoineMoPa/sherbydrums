@@ -242,6 +242,7 @@ impl Drummer {
             {
                 editor.record_hit(&event, instrument, velocity);
             }
+            crate::midi::apply_synth_control(&bytes, &mut self.synth);
             crate::midi::apply_effect_control(&bytes, &mut self.settings.effects);
             // Preserve the editor's independent tempo, volume and draft when knobs move.
             let ready = if let Some(editor) = &self.editor {
@@ -1244,7 +1245,7 @@ impl eframe::App for Drummer {
                     let status = self.midi_error.as_deref().unwrap_or_else(||
                         self.midi.as_ref().map_or("MIDI disconnected", |input| input.status.as_str()));
                     ui.label(RichText::new(status).size(11.0).color(MUTED))
-                        .on_hover_text("Channel 1 keyboard and sustain. Channel 10 pads 44–51. Channel 1 knobs 14, 15, 30, 31. Reconnect after adding or unplugging a device.");
+                        .on_hover_text("Channel 1 keyboard and sustain. Synth knobs: 74 Tone, 71 Attack, 76 Release, 77 Volume. Effects: 14, 15, 30, 31. Channel 10 pads 44–51. Reconnect after adding or unplugging a device.");
                     if self.midi.as_ref().is_some_and(|input| input.dropped() > 0) {
                         ui.label("MIDI input overloaded; some events were dropped");
                     }
