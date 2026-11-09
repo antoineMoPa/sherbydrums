@@ -227,6 +227,32 @@ impl EffectControl {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlSection {
+    Effects,
+    Sound,
+    Synth,
+    Arpeggiator,
+}
+
+pub fn control_section(bytes: &[u8]) -> Option<ControlSection> {
+    if EffectControl::from_midi(bytes).is_some() {
+        return Some(ControlSection::Effects);
+    }
+    match SynthControl::from_midi(bytes)? {
+        SynthControl::SoundStep(0) => None,
+        SynthControl::SoundStep(_) => Some(ControlSection::Sound),
+        SynthControl::Tone(_)
+        | SynthControl::Attack(_)
+        | SynthControl::Release(_)
+        | SynthControl::Volume(_) => Some(ControlSection::Synth),
+        SynthControl::ArpNotes(_)
+        | SynthControl::ArpPattern(_)
+        | SynthControl::ArpRate(_)
+        | SynthControl::ArpOctaves(_) => Some(ControlSection::Arpeggiator),
+    }
+}
+
 pub fn apply_effect_control(bytes: &[u8], effects: &mut EffectSettings) -> bool {
     let Some(control) = EffectControl::from_midi(bytes) else {
         return false;
@@ -253,6 +279,35 @@ pub fn pad_hit(bytes: &[u8]) -> Option<(Instrument, u8)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scroll_targets_follow_supported_controls_only() {
+        use super::*;
+        for (section, controls) in [
+            (
+                ControlSection::Effects,
+                &[14, 15, 30, 31, 82, 83, 85, 17][..],
+            ),
+            (ControlSection::Sound, &[114][..]),
+            (ControlSection::Synth, &[74, 71, 76, 77][..]),
+            (ControlSection::Arpeggiator, &[93, 18, 19, 16][..]),
+        ] {
+            for control in controls {
+                assert_eq!(control_section(&[0xb0, *control, 65]), Some(section));
+                assert_eq!(control_section(&[0xb1, *control, 65]), None);
+            }
+        }
+        for bytes in [
+            &[0xb0, 114, 64][..],
+            &[0xb0, 64, 127],
+            &[0xb0, 118, 127],
+            &[0x90, 60, 100],
+            &[0x99, 44, 100],
+            &[0xb0, 74, 128],
+        ] {
+            assert_eq!(control_section(bytes), None);
+        }
+    }
+
     #[test]
     fn arp_knobs_cover_choices_without_changing_other_settings() {
         for value in 0..=127 {

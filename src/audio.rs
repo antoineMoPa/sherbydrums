@@ -28,6 +28,7 @@ impl Telemetry {
 
     fn publish(&self, position: Position) {
         let bits = u64::from(position.running)
+            | (u64::from(position.stop_pending) << 1)
             | ((position.step as u64) << 2)
             | ((position.style.index() as u64) << 6)
             | (u64::from(position.fill_pending) << 10)
@@ -42,6 +43,7 @@ impl Telemetry {
         Position {
             custom_id: (bits >> 48) as u16,
             running: bits & 1 != 0,
+            stop_pending: bits & 2 != 0,
             step: ((bits >> 2) & 15) as usize,
             style: Style::ALL[((bits >> 6) & 15) as usize],
             fill_pending: bits & (1 << 10) != 0,
@@ -158,6 +160,7 @@ mod tests {
         let expected = Position {
             custom_id: u16::MAX,
             running: true,
+            stop_pending: true,
             step: 15,
             bar: 123_456,
             style: Style::Blues,
@@ -171,6 +174,7 @@ mod tests {
                     style,
                     bar: (1_u64 << 36) - 1,
                     running: flags & 1 != 0,
+                    stop_pending: flags & 2 != 0,
                     fill_pending: flags & 4 != 0,
                     filling: flags & 8 != 0,
                     ..expected

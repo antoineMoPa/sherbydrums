@@ -65,6 +65,9 @@ pub enum Command {
     Play,
     PlayOnce,
     Stop,
+    /// Finish the current measure before stopping.
+    QueueStop,
+    CancelStop,
     Fill,
 }
 
@@ -72,6 +75,7 @@ pub enum Command {
 pub struct Position {
     pub custom_id: u16,
     pub running: bool,
+    pub stop_pending: bool,
     pub step: usize,
     pub bar: u64,
     pub style: Style,
@@ -92,6 +96,7 @@ pub struct Engine {
     next_step: usize,
     started: bool,
     play_once: bool,
+    ringing_out: bool,
     frames_until_step: f64,
     gain: f32,
     active_pattern: Pattern,
@@ -112,6 +117,7 @@ impl Engine {
             position: Position {
                 custom_id: 0,
                 running: false,
+                stop_pending: false,
                 step: 0,
                 bar: 1,
                 style: Style::Rock,
@@ -121,6 +127,7 @@ impl Engine {
             next_step: 0,
             started: false,
             play_once: false,
+            ringing_out: false,
             frames_until_step: 0.0,
             gain: 0.0,
             active_pattern: *groove(Style::Rock),
@@ -195,10 +202,12 @@ impl Engine {
                 }
             }
             Command::Play if !self.position.running => {
+                self.ringing_out = false;
                 self.skip_recorded = [[false; STEPS]; crate::groove::INSTRUMENTS];
                 self.position = Position {
                     custom_id: self.settings.custom.map_or(0, |p| p.id),
                     running: true,
+                    stop_pending: false,
                     step: 0,
                     bar: 1,
                     style: self.settings.style,
@@ -211,7 +220,13 @@ impl Engine {
                 self.next_step = 0;
                 self.frames_until_step = 0.0;
             }
+            Command::QueueStop if self.position.running => {
+                self.position.stop_pending = true;
+            }
+            Command::CancelStop => self.position.stop_pending = false,
             Command::Stop => {
+                self.ringing_out = false;
+                self.position.stop_pending = false;
                 self.play_once = false;
                 self.position.running = false;
                 self.position.fill_pending = false;
@@ -294,15 +309,20 @@ impl Engine {
             // Quantize to the nearest frame; fractional remainders carry into the
             // next step, including tiny floating-point errors at bar boundaries.
             if self.frames_until_step < 0.5 {
-                if self.play_once && self.started && self.next_step == 0 {
+                if (self.play_once || self.position.stop_pending)
+                    && self.started
+                    && self.next_step == 0
+                {
+                    let ring_out = self.position.stop_pending;
                     self.command(Command::Stop);
+                    self.ringing_out = ring_out;
                 } else {
                     self.trigger_step();
                 }
             }
             self.frames_until_step -= 1.0;
         }
-        let target = if self.position.running {
+        let target = if self.position.running || self.ringing_out {
             f32::from(self.settings.volume) / 100.0
         } else {
             0.0
@@ -558,6 +578,117 @@ mod tests {
         for _ in 0..frames {
             engine.next_sample();
         }
+    }
+
+    #[test]
+    fn queued_stop_finishes_the_measure_without_triggering_next_downbeat() {
+        for bpm in [120, 240] {
+            for swing in [0, 60] {
+                for request_frame in [0, 12_345, 47_999] {
+                    let mut engine = playing(bpm);
+                    engine.command(Command::Apply(Settings {
+                        bpm,
+                        swing,
+                        ..Default::default()
+                    }));
+                    advance(&mut engine, request_frame);
+                    engine.command(Command::QueueStop);
+                    engine.command(Command::QueueStop);
+                    assert!(engine.position().stop_pending);
+                    advance(&mut engine, 48_000 * 240 / usize::from(bpm) - request_frame);
+                    assert!(engine.position().running);
+                    assert_eq!(engine.position().step, 15);
+                    engine.next_sample();
+                    assert!(!engine.position().running);
+                    assert!(!engine.position().stop_pending);
+                    assert_eq!(engine.position().bar, 1);
+                    engine.command(Command::Play);
+                    advance(&mut engine, 100_000);
+                    assert!(engine.position().running);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queued_stop_preserves_full_drum_and_effect_tails() {
+        for enabled in [false, true] {
+            let mut pattern = Pattern {
+                hits: [[0; STEPS]; crate::groove::INSTRUMENTS],
+            };
+            pattern.hits[Instrument::Crash.index()][15] = 127;
+            let settings = Settings {
+                bpm: 120,
+                custom: Some(CustomPattern { id: 1, pattern }),
+                effects: EffectSettings {
+                    enabled,
+                    delay: 80,
+                    reverb: 80,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut stopped = Engine::new(48_000);
+            let mut reference = Engine::new(48_000);
+            for engine in [&mut stopped, &mut reference] {
+                engine.command(Command::Apply(settings));
+                engine.command(Command::Play);
+                advance(engine, 96_000);
+            }
+            stopped.command(Command::QueueStop);
+            // The reference keeps running with an empty pattern: identical tails,
+            // but no new hits, even after multiple measure boundaries.
+            reference.command(Command::Apply(Settings {
+                custom: Some(CustomPattern {
+                    id: 2,
+                    pattern: Pattern {
+                        hits: [[0; STEPS]; crate::groove::INSTRUMENTS],
+                    },
+                }),
+                ..settings
+            }));
+            let mut tail_energy = 0.0;
+            for frame in 0..240_000 {
+                let sample = stopped.next_sample();
+                assert_eq!(
+                    sample,
+                    reference.next_sample(),
+                    "tail differs at frame {frame}"
+                );
+                if frame > 480 {
+                    tail_energy += sample.abs();
+                }
+            }
+            assert!(!stopped.position().running);
+            assert!(!stopped.position().stop_pending);
+            assert!(tail_energy > 1.0);
+        }
+    }
+
+    #[test]
+    fn queued_stop_can_be_cancelled_and_tracks_tempo_changes() {
+        let mut engine = playing(120);
+        advance(&mut engine, 24_000);
+        engine.command(Command::QueueStop);
+        engine.command(Command::CancelStop);
+        advance(&mut engine, 72_001);
+        assert!(engine.position().running);
+        assert_eq!(engine.position().bar, 2);
+        assert!(!engine.position().stop_pending);
+
+        let mut engine = playing(120);
+        advance(&mut engine, 24_000);
+        engine.command(Command::QueueStop);
+        engine.command(Command::Apply(Settings {
+            bpm: 240,
+            ..Default::default()
+        }));
+        advance(&mut engine, 36_000);
+        assert!(engine.position().running);
+        engine.next_sample();
+        assert!(!engine.position().running);
+        engine.command(Command::QueueStop);
+        assert!(!engine.position().stop_pending);
     }
 
     #[test]

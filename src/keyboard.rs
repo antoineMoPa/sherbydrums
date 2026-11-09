@@ -221,9 +221,10 @@ impl Keyboard {
             return;
         }
         let reset = self.settings.arp != settings.arp
-            || self.settings.notes != settings.notes
-            || self.settings.order != settings.order
-            || self.settings.octaves != settings.octaves;
+            || (settings.arp
+                && (self.settings.notes != settings.notes
+                    || self.settings.order != settings.order
+                    || self.settings.octaves != settings.octaves));
         let ratio = self.settings.rate.per_beat() / settings.rate.per_beat();
         self.frames *= ratio;
         self.gate_frames *= ratio;
@@ -267,13 +268,8 @@ impl Keyboard {
                     self.latched.fill(0);
                 }
                 if !self.settings.arp {
-                    if self.settings.notes == Notes::Played {
-                        self.release_note(note);
-                        self.desired[usize::from(note)] = 0;
-                    } else {
-                        self.release_all();
-                        self.desired.fill(0);
-                    }
+                    self.release_note(note);
+                    self.desired[usize::from(note)] = 0;
                 }
                 self.serial = self.serial.wrapping_add(1);
                 self.order[usize::from(note)] = self.serial;
@@ -338,7 +334,7 @@ impl Keyboard {
             held = self.latched;
         }
         let mut base = [0_u8; 128];
-        if self.settings.notes == Notes::Played {
+        if !self.settings.arp || self.settings.notes == Notes::Played {
             base = held;
         } else if let Some(root) = (0..128)
             .filter(|n| held[*n] > 0)
@@ -683,6 +679,46 @@ mod tests {
         }
     }
     #[test]
+    fn disabled_arp_plays_only_held_keys_and_preserves_chord_setting() {
+        let mut k = Keyboard::new(48_000);
+        let mut settings = SynthSettings::default();
+        assert_eq!(settings.notes, Notes::Minor);
+        on(&mut k, 60);
+        on(&mut k, 64);
+        assert_eq!(pitches(&k), vec![60, 64]);
+        assert_eq!(
+            k.voices.iter().filter(|v| v.active && !v.releasing).count(),
+            2
+        );
+        for notes in Notes::ALL {
+            settings.notes = *notes;
+            k.configure(settings);
+            assert_eq!(pitches(&k), vec![60, 64]);
+            assert_eq!(k.voices.iter().filter(|v| v.active).count(), 2);
+        }
+        settings.notes = Notes::Minor;
+        settings.arp = true;
+        k.configure(settings);
+        assert_eq!(pitches(&k), vec![64, 67, 71]);
+        k.next_sample();
+        settings.arp = false;
+        k.configure(settings);
+        assert_eq!(k.settings.notes, Notes::Minor);
+        assert_eq!(pitches(&k), vec![60, 64]);
+        let sounding: Vec<_> = k
+            .voices
+            .iter()
+            .filter(|v| v.active && !v.releasing)
+            .map(|v| v.note)
+            .collect();
+        assert_eq!(sounding, vec![60, 64]);
+        k.event(0, KeyEvent::Off { note: 64 });
+        assert_eq!(pitches(&k), vec![60]);
+        k.event(0, KeyEvent::Off { note: 60 });
+        assert!(pitches(&k).is_empty());
+    }
+
+    #[test]
     fn chord_choices_expand_from_latest_key_and_stay_in_midi_range() {
         let mut k = played_keyboard(48_000);
         for (notes, expected) in [
@@ -695,6 +731,7 @@ mod tests {
             k.panic();
             k.configure(SynthSettings {
                 notes,
+                arp: true,
                 ..played_settings()
             });
             on(&mut k, 60);

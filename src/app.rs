@@ -1,4 +1,4 @@
-use crate::audio::Output;
+use crate::{audio::Output, midi::ControlSection};
 use eframe::egui::{self, Color32, FontId, RichText, Sense, Stroke, Vec2};
 use sherbydrum::{
     engine::{Command, CustomPattern, Position, Settings},
@@ -96,7 +96,31 @@ impl Editor {
     }
 }
 
+#[derive(Default)]
+struct MidiReveal {
+    pending: Option<ControlSection>,
+}
+impl MidiReveal {
+    fn request(&mut self, bytes: &[u8], editor_open: bool) {
+        if editor_open {
+            self.pending = None;
+        } else if let Some(section) = crate::midi::control_section(bytes) {
+            self.pending = Some(section);
+        }
+    }
+    fn show(&mut self, section: ControlSection, response: &egui::Response, editor_open: bool) {
+        if editor_open {
+            self.pending = None;
+        } else if self.pending == Some(section) {
+            // None preserves the current position when the whole row is already visible.
+            response.scroll_to_me(None);
+            self.pending = None;
+        }
+    }
+}
+
 pub struct Drummer {
+    midi_reveal: MidiReveal,
     synth: SynthSettings,
     sent_synth: Option<SynthSettings>,
     midi_dropped: usize,
@@ -110,6 +134,7 @@ pub struct Drummer {
     output: Option<Output>,
     error: Option<String>,
     playing: bool,
+    stopping: bool,
     taps: VecDeque<Instant>,
     customs: Vec<SavedPattern>,
     pattern_path: Option<std::path::PathBuf>,
@@ -161,6 +186,7 @@ impl Drummer {
             ),
         };
         let mut app = Self {
+            midi_reveal: MidiReveal::default(),
             synth: SynthSettings::default(),
             sent_synth: None,
             midi_dropped: 0,
@@ -176,6 +202,7 @@ impl Drummer {
             output: None,
             error: None,
             playing: false,
+            stopping: false,
             taps: VecDeque::with_capacity(5),
             customs,
             pattern_path,
@@ -238,8 +265,12 @@ impl Drummer {
             {
                 editor.record_hit(&event, instrument, velocity);
             }
-            crate::midi::apply_synth_control(&bytes, &mut self.synth);
-            crate::midi::apply_effect_control(&bytes, &mut self.settings.effects);
+            let synth_control = crate::midi::apply_synth_control(&bytes, &mut self.synth);
+            let effect_control =
+                crate::midi::apply_effect_control(&bytes, &mut self.settings.effects);
+            if synth_control || effect_control {
+                self.midi_reveal.request(&bytes, self.editor.is_some());
+            }
             // Preserve the editor's independent tempo, volume and draft when knobs move.
             let ready = if let Some(editor) = &self.editor {
                 let settings = preview_settings(editor, self.settings.swing, self.settings.effects);
@@ -277,6 +308,7 @@ impl Drummer {
     fn connect(&mut self) {
         self.output = None;
         self.playing = false;
+        self.stopping = false;
         self.sent_settings = None;
         self.sent_synth = None;
         match Output::open() {
@@ -335,12 +367,19 @@ impl Drummer {
         if !self.sync_settings() {
             return;
         }
-        if self.send(if self.playing {
-            Command::Stop
+        let command = if self.stopping {
+            Command::CancelStop
+        } else if self.playing {
+            Command::QueueStop
         } else {
             Command::Play
-        }) {
-            self.playing = !self.playing;
+        };
+        if self.send(command) {
+            if self.playing {
+                self.stopping = !self.stopping;
+            } else {
+                self.playing = true;
+            }
         }
     }
 
@@ -370,6 +409,7 @@ impl Drummer {
             .map(|o| o.telemetry.position())
             .unwrap_or(Position {
                 running: false,
+                stop_pending: false,
                 step: 0,
                 bar: 1,
                 style: self.settings.style,
@@ -405,6 +445,7 @@ impl Drummer {
     fn open_editor(&mut self, blank: bool) {
         if self.playing && self.send(Command::Stop) {
             self.playing = false;
+            self.stopping = false;
         }
         let (draft, target) = if blank {
             let mut pattern = Pattern {
@@ -540,9 +581,15 @@ impl Drummer {
                         .add_enabled(
                             self.output.is_some(),
                             egui::Button::new(
-                                RichText::new(if self.playing { "■ Stop" } else { "    Play" })
-                                    .size(15.0)
-                                    .color(BACKGROUND),
+                                RichText::new(if self.stopping {
+                                    "Stop queued"
+                                } else if self.playing {
+                                    "■ Stop"
+                                } else {
+                                    "    Play"
+                                })
+                                .size(15.0)
+                                .color(BACKGROUND),
                             )
                             .fill(LIME)
                             .min_size(Vec2::new(unit, 56.0)),
@@ -605,15 +652,17 @@ impl Drummer {
             });
             ui.add_enabled_ui(self.synth.enabled, |ui| {
                 let old_sound = self.synth.sound;
-                choice(ui, "Sound", &mut self.synth.sound, Sound::ALL, Sound::label);
+                let sound_row=ui.scope(|ui| { choice(ui, "Sound", &mut self.synth.sound, Sound::ALL, Sound::label); }).response;
+                self.midi_reveal.show(ControlSection::Sound,&sound_row,self.editor.is_some());
                 if self.synth.sound != old_sound { self.synth.select_sound(self.synth.sound); }
                 ui.add_space(12.0);
-                ui.columns(4, |cols| {
+                let synth_row=ui.scope(|ui| { ui.columns(4, |cols| {
                     slider(&mut cols[0], "Tone", &mut self.synth.tone, 100);
                     milliseconds(&mut cols[1], "Attack", &mut self.synth.attack_ms, 0..=1000);
                     milliseconds(&mut cols[2], "Release", &mut self.synth.release_ms, 30..=2000);
                     slider(&mut cols[3], "Volume", &mut self.synth.volume, 100);
-                });
+                }); }).response;
+                self.midi_reveal.show(ControlSection::Synth,&synth_row,self.editor.is_some());
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -627,13 +676,14 @@ impl Drummer {
                     });
                 });
                 ui.add_space(10.0);
-                ui.columns(4, |cols| {
+                let arp_row=ui.scope(|ui| { ui.columns(4, |cols| {
                     choice(&mut cols[0], "Notes", &mut self.synth.notes, Notes::ALL, Notes::label)
                         .on_hover_text("Played uses your held notes. Chord modes use your most recently pressed key as the root.");
                     cols[1].add_enabled_ui(self.synth.arp, |ui| { choice(ui, "Pattern", &mut self.synth.order, Order::ALL, Order::label); });
                     cols[2].add_enabled_ui(self.synth.arp, |ui| { choice(ui, "Rate", &mut self.synth.rate, Rate::ALL, Rate::label); });
                     cols[3].add_enabled_ui(self.synth.arp, |ui| { choice(ui, "Octaves", &mut self.synth.octaves, &[1,2,3], |n| match n {1=>"1",2=>"2",_=>"3"}); });
-                });
+                }); }).response;
+                self.midi_reveal.show(ControlSection::Arpeggiator,&arp_row,self.editor.is_some());
                 ui.add_space(10.0);
                 ui.add_enabled_ui(self.synth.arp, |ui| {
                     ui.horizontal(|ui| {
@@ -646,7 +696,7 @@ impl Drummer {
     }
 
     fn effects_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::NONE
+        let effects_row = egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(28, 18))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -663,7 +713,10 @@ impl Drummer {
                     slider(&mut cols[2], "Delay", &mut effects.delay, 100);
                     slider(&mut cols[3], "Reverb", &mut effects.reverb, 100);
                 });
-            });
+            })
+            .response;
+        self.midi_reveal
+            .show(ControlSection::Effects, &effects_row, self.editor.is_some());
         ui.separator();
     }
 
@@ -1133,6 +1186,7 @@ impl eframe::App for Drummer {
         {
             self.output = None;
             self.playing = false;
+            self.stopping = false;
             self.sent_settings = None;
             if let Some(editor) = &mut self.editor {
                 editor.preview = false;
@@ -1141,6 +1195,10 @@ impl eframe::App for Drummer {
             }
             self.error =
                 Some("Audio output disconnected. Reconnect your speakers or headphones.".into());
+        }
+        if self.stopping && !self.position().running {
+            self.playing = false;
+            self.stopping = false;
         }
         self.handle_midi();
         #[cfg(target_os = "macos")]
@@ -1164,7 +1222,9 @@ impl eframe::App for Drummer {
                         }
                     }
                     self.editor = Some(editor);
-                } else if action.desired(self.playing) != self.playing {
+                } else if action.desired(self.playing && !self.stopping)
+                    != (self.playing && !self.stopping)
+                {
                     self.toggle_play();
                 }
             }
@@ -1468,6 +1528,64 @@ fn preview_settings(
 mod tests {
     use super::*;
 
+    #[test]
+    fn midi_reveal_uses_latest_control_and_ignores_editor() {
+        let mut reveal = MidiReveal::default();
+        reveal.request(&[0xb0, 74, 80], false);
+        reveal.request(&[0xb0, 93, 40], false);
+        reveal.request(&[0x90, 60, 100], false);
+        assert_eq!(reveal.pending, Some(ControlSection::Arpeggiator));
+        reveal.request(&[0xb0, 82, 80], true);
+        assert_eq!(reveal.pending, None);
+    }
+
+    #[test]
+    fn midi_reveal_scrolls_only_when_row_is_offscreen() {
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut reveal = MidiReveal::default();
+        let frame = |reveal: &mut MidiReveal| {
+            let mut offset = 0.0;
+            let mut visible = false;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(400.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut row = egui::Rect::NOTHING;
+                    let output = egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            ui.add_space(400.0);
+                            let response =
+                                ui.allocate_response(Vec2::new(200.0, 40.0), egui::Sense::hover());
+                            row = response.rect;
+                            reveal.show(ControlSection::Synth, &response, false);
+                            ui.add_space(400.0);
+                        });
+                    offset = output.state.offset.y;
+                    visible = output.inner_rect.contains_rect(row);
+                },
+            );
+            output.textures_delta.clear();
+            (offset, visible)
+        };
+        assert_eq!(frame(&mut reveal).0, 0.0);
+        reveal.request(&[0xb0, 74, 80], false);
+        frame(&mut reveal);
+        frame(&mut reveal);
+        let (offset, visible) = frame(&mut reveal);
+        assert!(offset > 0.0);
+        assert!(visible);
+        reveal.request(&[0xb0, 74, 81], false);
+        frame(&mut reveal);
+        assert_eq!(frame(&mut reveal), (offset, true));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "Requires native CoreMIDI and an audio output device"]
@@ -1490,6 +1608,7 @@ mod tests {
         output.send(Command::Preview(settings)).unwrap();
         output.send(Command::Play).unwrap();
         let mut app = Drummer {
+            midi_reveal: MidiReveal::default(),
             synth: SynthSettings::default(),
             sent_synth: None,
             midi_dropped: 0,
@@ -1502,6 +1621,7 @@ mod tests {
             output: Some(output),
             error: None,
             playing: false,
+            stopping: false,
             taps: VecDeque::new(),
             customs: Vec::new(),
             pattern_path: None,
