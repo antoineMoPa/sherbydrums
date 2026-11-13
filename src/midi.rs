@@ -127,13 +127,13 @@ impl Input {
 
 fn pad_instrument(note: u8) -> Option<Instrument> {
     match note {
-        44 => Some(Instrument::Kick),
-        45 | 51 => Some(Instrument::Snare),
-        46 => Some(Instrument::ClosedHat),
-        47 => Some(Instrument::OpenHat),
-        48 => Some(Instrument::Rim),
-        49 => Some(Instrument::Tom),
-        50 => Some(Instrument::Crash),
+        36 | 44 => Some(Instrument::Kick),
+        37 | 43 | 45 | 51 => Some(Instrument::Snare),
+        38 | 46 => Some(Instrument::ClosedHat),
+        39 | 47 => Some(Instrument::OpenHat),
+        40 | 48 => Some(Instrument::Rim),
+        41 | 49 => Some(Instrument::Tom),
+        42 | 50 => Some(Instrument::Crash),
         _ => None,
     }
 }
@@ -373,13 +373,13 @@ mod tests {
         assert!(!apply_synth_control(&[0xb0, 114, 64], &mut settings));
         assert_eq!(settings.tone, 23);
         for (value, expected) in [
+            (65, Sound::Bass),
+            (64, Sound::Bass),
+            (66, Sound::Acid),
+            (64, Sound::Acid),
+            (61, Sound::Soft),
+            (63, Sound::Warm),
             (65, Sound::Soft),
-            (64, Sound::Soft),
-            (66, Sound::Bright),
-            (64, Sound::Bright),
-            (61, Sound::Warm),
-            (63, Sound::Organ),
-            (65, Sound::Warm),
         ] {
             apply_synth_control(&[0xb0, 114, value], &mut settings);
             assert_eq!(settings.sound, expected);
@@ -473,6 +473,27 @@ mod tests {
             ));
         }
         assert!((0..24000).map(|_| engine.next_sample().abs()).sum::<f32>() > 10.0);
+        for (bytes, value) in [
+            ([0xe0, 0x24, 0x40], 8228),
+            ([0xe0, 0x12, 0x3d], 7826),
+            ([0xe0, 0, 64], 8192),
+        ] {
+            source.send(&bytes).unwrap();
+            let mut received = Vec::new();
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(10));
+                received.extend(input.drain());
+                if !received.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(received.len(), 1);
+            let event = &received[0];
+            assert_eq!(event.bytes, bytes);
+            let bend = KeyEvent::from_midi(&event.bytes).unwrap();
+            assert_eq!(bend, KeyEvent::PitchBend(value));
+            engine.command(Command::Keyboard(event.source, bend));
+        }
         source.send(&[0xb0, 64, 0]).unwrap();
         let mut released = false;
         for _ in 0..50 {
@@ -544,19 +565,27 @@ mod tests {
             Instrument::Crash,
             Instrument::Snare,
         ];
-        for (note, instrument) in (44..=51).zip(expected) {
-            for velocity in [1, 66, 117, 127] {
-                assert_eq!(
-                    pad_hit(&[0x99, note, velocity]),
-                    Some((instrument, velocity))
-                );
+        for bank in [36..=43, 44..=51] {
+            for (note, instrument) in bank.zip(expected) {
+                for velocity in [1, 66, 117, 127] {
+                    assert_eq!(
+                        pad_hit(&[0x99, note, velocity]),
+                        Some((instrument, velocity))
+                    );
+                }
+                for status in 0x80..=0x9f {
+                    if status != 0x99 {
+                        assert_eq!(pad_hit(&[status, note, 100]), None);
+                    }
+                }
+                assert_eq!(pad_hit(&[0x99, note, 0]), None);
             }
         }
         for bytes in [
             &[0x89, 44, 64][..],
             &[0x99, 44, 0],
             &[0x90, 44, 100],
-            &[0x99, 43, 100],
+            &[0x99, 35, 100],
             &[0x99, 52, 100],
             &[0x99, 44],
             &[0xa9, 44, 100],

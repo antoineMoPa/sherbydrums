@@ -86,6 +86,12 @@ impl Editor {
         }
     }
 
+    fn clear(&mut self) {
+        self.undo_take = Some(self.draft.pattern);
+        self.draft.pattern.hits = [[0; STEPS]; INSTRUMENTS];
+        self.take_hits = [[false; STEPS]; INSTRUMENTS];
+    }
+
     fn undo(&mut self) {
         if self.recording.is_none()
             && let Some(pattern) = self.undo_take.take()
@@ -806,6 +812,7 @@ impl Drummer {
         let mut toggle_preview = false;
         let mut toggle_record = false;
         let mut restart_preview = false;
+        let mut audition = None;
         let position = self.position();
         let mut save = false;
         let mut close = false;
@@ -981,9 +988,21 @@ impl Drummer {
                                         Instrument::Tom,
                                         Instrument::Crash,
                                     ] {
-                                        ui.label(
-                                            RichText::new(instrument.name()).monospace().size(10.0),
-                                        );
+                                        if ui
+                                            .add_enabled(
+                                                self.output.is_some(),
+                                                egui::Button::new(
+                                                    RichText::new(instrument.name())
+                                                        .monospace()
+                                                        .size(10.0),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .on_hover_text(format!("Play {}", instrument.name()))
+                                            .clicked()
+                                        {
+                                            audition = Some(instrument);
+                                        }
                                         for step in 0..STEPS {
                                             let velocity = &mut editor.draft.pattern.hits
                                                 [instrument.index()][step];
@@ -1053,23 +1072,18 @@ impl Drummer {
                         });
                         ui.add_space(20.0);
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(editor.recording.is_none(), egui::Button::new("Clear"))
-                                .clicked()
-                            {
-                                editor.undo_take = Some(editor.draft.pattern);
-                                editor.draft.pattern.hits = [[0; STEPS]; INSTRUMENTS];
-                                editor.take_hits = [[false; STEPS]; INSTRUMENTS];
+                            if ui.button("Clear").clicked() {
+                                editor.clear();
                             }
                             let undo_response = ui.add_enabled(
                                 editor.recording.is_none() && editor.undo_take.is_some(),
-                                egui::Button::new("    Undo take"),
+                                egui::Button::new("      Undo take"),
                             );
                             paint_button_icon(
                                 ui,
                                 &undo_response,
                                 ButtonIcon::Undo,
-                                "    Undo take",
+                                "      Undo take",
                                 14.0,
                                 ink,
                             );
@@ -1127,10 +1141,13 @@ impl Drummer {
         if toggle_record {
             editor.toggle_recording(Instant::now());
         }
-        if editor.preview {
+        if editor.preview || audition.is_some() {
             let settings = preview_settings(&editor, self.settings.swing, self.settings.effects);
-            if editor.sent_preview != Some(settings) && self.send(Command::Preview(settings)) {
+            if editor.sent_preview == Some(settings) || self.send(Command::Preview(settings)) {
                 editor.sent_preview = Some(settings);
+                if let Some(instrument) = audition {
+                    self.send(Command::Hit(instrument, 100));
+                }
             }
             if restart_preview && self.send(Command::Stop) {
                 editor.preview = self.send(Command::Play);
@@ -1272,7 +1289,7 @@ impl eframe::App for Drummer {
                     let status = self.midi_error.as_deref().unwrap_or_else(||
                         self.midi.as_ref().map_or("MIDI disconnected", |input| input.status.as_str()));
                     ui.label(RichText::new(status).size(11.0).color(MUTED))
-                        .on_hover_text("Channel 1 keyboard and sustain. Synth knobs: 74 Tone, 71 Attack, 76 Release, 77 Volume. Encoder 114 selects sounds. Arp: 93 Notes, 18 Pattern, 19 Rate, 16 Octaves. Effects: 82/14 Drive, 83/15 Filter, 85/30 Delay, 17/31 Reverb. Channel 10 pads 44–51. Reconnect after adding or unplugging a device.");
+                        .on_hover_text("Channel 1 keyboard, sustain and pitch bend (±2 semitones). Synth knobs: 74 Tone, 71 Attack, 76 Release, 77 Volume. Encoder 114 selects sounds. Arp: 93 Notes, 18 Pattern, 19 Rate, 16 Octaves. Effects: 82/14 Drive, 83/15 Filter, 85/30 Delay, 17/31 Reverb. Channel 10 pads 36–43 and 44–51. Reconnect after adding or unplugging a device.");
                     if self.midi.as_ref().is_some_and(|input| input.dropped() > 0) {
                         ui.label("MIDI input overloaded; some events were dropped");
                     }
@@ -1633,8 +1650,8 @@ mod tests {
         source.send(&[0xb0, 118, 127]).unwrap();
         source.send(&[0xb0, 118, 127]).unwrap();
         source.send(&[0xb0, 118, 0]).unwrap();
-        source.send(&[0x99, 49, 82]).unwrap();
-        source.send(&[0x89, 49, 0]).unwrap();
+        source.send(&[0x99, 41, 82]).unwrap();
+        source.send(&[0x89, 41, 0]).unwrap();
         source.send(&[0xb0, 14, 127]).unwrap();
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(10));
@@ -1708,11 +1725,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             app.handle_midi();
             app.sync_synth();
-            if app.synth.sound == Sound::Soft {
+            if app.synth.sound == Sound::Bass {
                 break;
             }
         }
-        assert_eq!(app.synth.sound, Sound::Soft);
+        assert_eq!(app.synth.sound, Sound::Bass);
         assert_eq!(app.sent_synth, Some(app.synth));
         for (control, value) in [(93, 64), (18, 64), (19, 90), (16, 127)] {
             source.send(&[0xb0, control, value]).unwrap();
@@ -1889,6 +1906,61 @@ mod tests {
             assert!(editor.recording.is_none());
             assert_eq!(editor.preview, playing);
             assert_eq!(editor.sent_preview, Some(settings));
+        }
+    }
+
+    #[test]
+    fn clear_preserves_transport_and_recording_and_can_be_undone() {
+        let now = Instant::now();
+        let empty = Pattern {
+            hits: [[0; STEPS]; INSTRUMENTS],
+        };
+        for preview in [false, true] {
+            for recording in [false, true] {
+                let mut editor = test_editor();
+                editor.preview = preview;
+                if recording {
+                    editor.begin_take(now);
+                }
+                let event = crate::midi::Event {
+                    source: 0,
+                    bytes: [0x99, 49, 82],
+                    received_at: now,
+                    step: Some(3),
+                };
+                editor.record_hit(&event, Instrument::Tom, 82);
+                let before = editor.draft.pattern;
+                let sent = preview_settings(&editor, 0, Default::default());
+                editor.sent_preview = Some(sent);
+
+                editor.clear();
+
+                assert_eq!(editor.draft.pattern, empty);
+                assert_eq!(editor.take_hits, [[false; STEPS]; INSTRUMENTS]);
+                assert_eq!(editor.preview, preview);
+                assert_eq!(editor.recording, recording.then_some(now));
+                assert_eq!(editor.sent_preview, Some(sent));
+                assert_eq!(
+                    preview_settings(&editor, 0, Default::default())
+                        .custom
+                        .unwrap()
+                        .pattern,
+                    empty
+                );
+                assert_eq!(editor.undo_take, Some(before));
+
+                editor.record_hit(&event, Instrument::Tom, 82);
+                if preview && recording {
+                    assert_eq!(editor.draft.pattern.velocity(Instrument::Tom, 3), 82);
+                    assert!(editor.take_hits[Instrument::Tom.index()][3]);
+                } else {
+                    assert_eq!(editor.draft.pattern, empty);
+                }
+                editor.recording = None;
+                editor.undo();
+                assert_eq!(editor.draft.pattern, before);
+                assert_eq!(editor.take_hits, [[false; STEPS]; INSTRUMENTS]);
+            }
         }
     }
 

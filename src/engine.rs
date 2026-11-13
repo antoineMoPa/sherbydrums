@@ -428,7 +428,7 @@ mod tests {
             crate::keyboard::TEST_SOURCE,
             KeyEvent::AllOff,
         ));
-        for _ in 0..48_000 {
+        for _ in 0..48_000 * 2 {
             engine.next_sample();
         }
         assert_eq!(engine.next_sample(), 0.0);

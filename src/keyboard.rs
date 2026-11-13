@@ -73,10 +73,10 @@ impl Default for SynthSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            sound: Sound::Warm,
-            tone: 68,
-            attack_ms: 6,
-            release_ms: 500,
+            sound: Sound::Soft,
+            tone: 48,
+            attack_ms: 420,
+            release_ms: 1400,
             volume: 65,
             arp: false,
             notes: Notes::Minor,
@@ -121,6 +121,7 @@ pub enum KeyEvent {
     On { note: u8, velocity: u8 },
     Off { note: u8 },
     Sustain(bool),
+    PitchBend(u16),
     AllOff,
 }
 impl KeyEvent {
@@ -135,10 +136,24 @@ impl KeyEvent {
                 Some(Self::Off { note: *note })
             }
             [0xb0, 64, value @ 0..=127] => Some(Self::Sustain(*value >= 64)),
+            [0xe0, low @ 0..=127, high @ 0..=127] => {
+                Some(Self::PitchBend(u16::from(*low) | (u16::from(*high) << 7)))
+            }
             [0xb0, 120 | 123, 0..=127] => Some(Self::AllOff),
             _ => None,
         }
     }
+}
+
+/// Map the 14-bit wheel to +/-2 semitones, with exact center and endpoints.
+fn pitch_bend_ratio(value: u16) -> f32 {
+    let offset = f32::from(value) - 8192.0;
+    let semitones = if value < 8192 {
+        offset * 2.0 / 8192.0
+    } else {
+        offset * 2.0 / 8191.0
+    };
+    2.0_f32.powf(semitones / 12.0)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -175,6 +190,9 @@ pub struct Keyboard {
     color_decay: f32,
     tone: f32,
     gain: f32,
+    pitch: f32,
+    target_pitch: f32,
+    pitch_smoothing: f32,
     random: u32,
     pub sounding_note: Option<u8>,
 }
@@ -201,6 +219,9 @@ impl Keyboard {
             color_decay: 0.0,
             tone: 0.0,
             gain: 0.0,
+            pitch: 1.0,
+            target_pitch: 1.0,
+            pitch_smoothing: 1.0 - (-1.0 / (sample_rate as f32 * 0.002)).exp(),
             random: 0x724a_138b,
             sounding_note: None,
         };
@@ -261,6 +282,11 @@ impl Keyboard {
             return;
         }
         match event {
+            KeyEvent::PitchBend(value) if value <= 16383 => {
+                self.target_pitch = pitch_bend_ratio(value);
+                // Keep held voices, envelopes and the arpeggiator clock intact.
+                return;
+            }
             KeyEvent::On { note, velocity }
                 if note < 128 && velocity > 0 && velocity < 128 && self.settings.enabled =>
             {
@@ -306,6 +332,8 @@ impl Keyboard {
         self.keys.fill([0; 128]);
         self.pressed.fill([false; 128]);
         self.pedal.fill(false);
+        self.pitch = 1.0;
+        self.target_pitch = 1.0;
         self.latched.fill(0);
         self.desired.fill(0);
         self.len = 0;
@@ -486,6 +514,7 @@ impl Keyboard {
             1.0 / (self.sample_rate * (f32::from(self.settings.attack_ms) / 1000.0).max(0.003));
         self.tone +=
             (f32::from(self.settings.tone) / 100.0 - self.tone) / (self.sample_rate * 0.01);
+        self.pitch += (self.target_pitch - self.pitch) * self.pitch_smoothing;
         let mut sum = 0.0;
         for voice in &mut self.voices {
             if !voice.active {
@@ -502,7 +531,7 @@ impl Keyboard {
             }
             let wave = voice.timbre.sample(
                 self.settings.sound,
-                voice.increment,
+                (voice.increment * self.pitch).min(0.45),
                 self.sample_rate,
                 self.tone,
                 voice.velocity,
@@ -546,6 +575,98 @@ mod tests {
     }
     fn energy(k: &mut Keyboard, frames: usize) -> f32 {
         (0..frames).map(|_| k.next_sample().abs()).sum()
+    }
+
+    #[test]
+    fn midi_pitch_bend_decodes_full_resolution_on_channel_one() {
+        for (bytes, value) in [
+            ([0xe0, 0, 0], 0),
+            ([0xe0, 0, 64], 8192),
+            ([0xe0, 127, 127], 16383),
+            ([0xe0, 0x24, 0x40], 8228),
+            ([0xe0, 0x12, 0x3d], 7826),
+            ([0xe0, 0x7f, 0x49], 9471),
+        ] {
+            assert_eq!(
+                KeyEvent::from_midi(&bytes),
+                Some(KeyEvent::PitchBend(value))
+            );
+        }
+        for bytes in [
+            &[0xe1, 0, 64][..],
+            &[0xe9, 0, 64],
+            &[0xe0, 128, 64],
+            &[0xe0, 0, 128],
+            &[0xe0, 0],
+            &[0xb0, 1, 76],
+        ] {
+            assert_eq!(KeyEvent::from_midi(bytes), None);
+        }
+    }
+
+    #[test]
+    fn pitch_bend_retunes_held_audio_and_returns_to_center_without_retriggering() {
+        for rate in [44_100, 48_000, 96_000] {
+            let mut k = played_keyboard(rate);
+            let mut settings = played_settings();
+            // Use a voice without detuned oscillators for zero-crossing measurements.
+            settings.select_sound(Sound::Warm);
+            settings.tone = 0;
+            k.configure(settings);
+            on(&mut k, 69);
+            energy(&mut k, rate as usize / 10);
+            for (value, expected_hz) in [(16383, 493.88), (0, 392.0), (8192, 440.0)] {
+                let level = k.voices[0].level;
+                let pitch = k.pitch;
+                k.event(0, KeyEvent::PitchBend(value));
+                assert_eq!(k.pitch, pitch); // Changes ramp on the audio clock.
+                assert_eq!(k.voices[0].level, level);
+                assert!(!k.voices[0].releasing);
+                energy(&mut k, rate as usize / 10);
+                let mut previous = 0.0;
+                let mut crossings = 0;
+                for _ in 0..rate {
+                    let sample = k.next_sample();
+                    assert!(sample.is_finite());
+                    if previous <= 0.0 && sample > 0.0 {
+                        crossings += 1;
+                    }
+                    previous = sample;
+                }
+                assert!(
+                    (crossings as f32 - expected_hz).abs() < 2.0,
+                    "Wheel {value} at {rate} Hz: heard {crossings}, expected {expected_hz} Hz"
+                );
+                assert_eq!(pitches(&k), vec![69]);
+            }
+            k.event(0, KeyEvent::PitchBend(16383));
+            k.event(0, KeyEvent::PitchBend(16384));
+            assert_eq!(k.target_pitch, pitch_bend_ratio(16383));
+            k.panic();
+            assert_eq!(k.pitch, 1.0);
+            assert_eq!(k.target_pitch, 1.0);
+        }
+    }
+
+    #[test]
+    fn pitch_bend_keeps_arp_timing_and_applies_to_subsequent_notes() {
+        let mut k = played_keyboard(48_000);
+        k.configure(SynthSettings {
+            arp: true,
+            ..played_settings()
+        });
+        on(&mut k, 60);
+        on(&mut k, 64);
+        energy(&mut k, 1000);
+        let before = (k.frames, k.gate_frames, k.step, k.sounding_note);
+        k.event(0, KeyEvent::PitchBend(0));
+        assert_eq!((k.frames, k.gate_frames, k.step, k.sounding_note), before);
+        let until_next = k.frames.ceil() as usize;
+        energy(&mut k, until_next + 1);
+        assert_eq!(k.sounding_note, Some(64));
+        assert_eq!(k.step, before.2 + 1);
+        assert!((k.pitch - pitch_bend_ratio(0)).abs() < 0.0001);
+        assert_eq!(pitches(&k), vec![60, 64]);
     }
 
     #[test]
@@ -627,6 +748,7 @@ mod tests {
                     settings.tone = 100;
                     k.configure(settings);
                     on(&mut k, note);
+                    k.event(0, KeyEvent::PitchBend(16383));
                     for _ in 0..rate / 10 {
                         let sample = k.next_sample();
                         assert!(
@@ -797,7 +919,7 @@ mod tests {
         });
         assert_eq!(k.len, 0);
         on(&mut k, 60);
-        assert!(energy(&mut k, 1000) > 1.0);
+        assert!(energy(&mut k, 48000) > 1.0);
         k.panic();
         energy(&mut k, 1000);
         assert_eq!(energy(&mut k, 1000), 0.0);
